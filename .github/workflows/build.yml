@@ -9,7 +9,6 @@ jobs:
     # macOS 14 镜像已于 2026-11-02 被 GitHub 全量退役。
     # 任何 runs-on: macos-14 都会在 1 秒内被取消并报:
     #   The configuration 'macos-14-arm64-us-default' is not supported
-    # 必须换成 macos-15。
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -21,12 +20,12 @@ jobs:
           git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
 
-      # Theos 在最后一步要给 dylib 做 ad-hoc 签名, macOS runner 默认没有 ldid。
-      # 少了这一步 make 会在 signing 阶段失败。
+      # Theos 最后要给 dylib 做 ad-hoc 签名, macOS runner 默认没有 ldid。
       - name: Install ldid
         run: |
           set -euo pipefail
           brew install ldid
+          command -v ldid
 
       - name: Fetch iOS SDKs
         run: |
@@ -39,11 +38,31 @@ jobs:
           echo "--- available SDKs ---"
           ls "$THEOS/sdks"
 
+      # 编译失败时把 tail 写进 Job Summary, 这样在 run 页面就能直接看到报错,
+      # 不必去下载日志或来回猜。
       - name: Build dylib
         run: |
-          set -euo pipefail
+          set -o pipefail
           make clean || true
-          make ARCHS="arm64 arm64e" FINALPACKAGE=1
+
+          set +e
+          make ARCHS="arm64 arm64e" FINALPACKAGE=1 > /tmp/build.log 2>&1
+          rc=$?
+          set -e
+
+          {
+            echo "## make exit code: $rc"
+            echo '```'
+            tail -n 250 /tmp/build.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$rc" -ne 0 ]; then
+            echo "===== build failed, tail of log ====="
+            tail -n 250 /tmp/build.log
+            exit "$rc"
+          fi
+
           echo "--- build output ---"
           find .theos -name '*.dylib' -print
 
