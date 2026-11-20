@@ -1,0 +1,9 @@
+Package: com.keyian.ysfdevicereset
+Name: YSFDeviceReset
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: 云闪付设备身份重置 (清 Keychain / 换 IDFV-IDFA / 压越狱检测)
+Maintainer: keyian
+Author: keyian
+Section: Tweaks
+Depends: firmware (>= 15.0)
