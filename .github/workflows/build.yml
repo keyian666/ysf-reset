@@ -1,0 +1,37 @@
+name: build-tweak
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Theos
+        run: |
+          export THEOS=$HOME/theos
+          git clone --recursive https://github.com/theos/theos.git $THEOS
+          curl -L https://github.com/theos/sdks/archive/master.tar.gz -o /tmp/sdks.tar.gz
+          mkdir -p $THEOS/sdks
+          tar -xzf /tmp/sdks.tar.gz -C /tmp
+          mv /tmp/sdks-master/*.sdk $THEOS/sdks/ || true
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+
+      - name: Build dylib
+        run: |
+          make clean || true
+          make ARCHS="arm64 arm64e" FINALPACKAGE=1
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          find .theos -name "*.dylib" -exec cp {} dist/ \;
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: YSFDeviceReset-dylib
+          path: dist/*.dylib
