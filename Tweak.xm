@@ -257,24 +257,6 @@ static void YSFSwizzleSelectorReturningNO(const char *selCStr) {
     free(classes);
 }
 
-static BOOL YSFAnyClassImplementsSelector(NSString *selName) {
-    SEL sel = NSSelectorFromString(selName);
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
-    if (!classes) return NO;
-    BOOL found = NO;
-    for (unsigned int i = 0; i < count && !found; i++) {
-        unsigned int mcount = 0;
-        Method *methods = class_copyMethodList(classes[i], &mcount);
-        for (unsigned int j = 0; j < mcount; j++) {
-            if (method_getName(methods[j]) == sel) { found = YES; break; }
-        }
-        if (methods) free(methods);
-    }
-    free(classes);
-    return found;
-}
-
 #pragma mark - ========== 钩子: 原生标识 ==========
 
 %hook UIDevice
