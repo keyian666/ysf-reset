@@ -205,12 +205,17 @@ static void YSFSwizzleSelectorReturningObject(const char *selCStr, id (^value)(v
 
             NSUInteger nargs = method_getNumberOfArguments(methods[j]) - 2;
             IMP imp = NULL;
-            switch (nargs) {
-                case 0: imp = imp_implementationWithBlock(^id(id self){ return value(); }); break;
-                case 1: imp = imp_implementationWithBlock(^id(id self, id a){ return value(); }); break;
-                case 2: imp = imp_implementationWithBlock(^id(id self, id a, id b){ return value(); }); break;
-                case 3: imp = imp_implementationWithBlock(^id(id self, id a, id b, id c){ return value(); }); break;
-                default: break;
+            // 注意: 这里必须是 if/else 而不是 switch。
+            // ARC 下 case 标签里声明"捕获了 value 的 block"属于跳过变量初始化的跳转,
+            // clang 会直接报 cannot jump from switch statement to this case label。
+            if (nargs == 0) {
+                imp = imp_implementationWithBlock(^id(id s){ return value(); });
+            } else if (nargs == 1) {
+                imp = imp_implementationWithBlock(^id(id s, id a){ return value(); });
+            } else if (nargs == 2) {
+                imp = imp_implementationWithBlock(^id(id s, id a, id b){ return value(); });
+            } else if (nargs == 3) {
+                imp = imp_implementationWithBlock(^id(id s, id a, id b, id c){ return value(); });
             }
             if (imp) method_setImplementation(methods[j], imp);
         }
@@ -238,11 +243,12 @@ static void YSFSwizzleSelectorReturningNO(const char *selCStr) {
 
             NSUInteger nargs = method_getNumberOfArguments(methods[j]) - 2;
             IMP imp = NULL;
-            switch (nargs) {
-                case 0: imp = imp_implementationWithBlock(^BOOL(id self){ return NO; }); break;
-                case 1: imp = imp_implementationWithBlock(^BOOL(id self, id a){ return NO; }); break;
-                case 2: imp = imp_implementationWithBlock(^BOOL(id self, id a, id b){ return NO; }); break;
-                default: break;
+            if (nargs == 0) {
+                imp = imp_implementationWithBlock(^BOOL(id s){ return NO; });
+            } else if (nargs == 1) {
+                imp = imp_implementationWithBlock(^BOOL(id s, id a){ return NO; });
+            } else if (nargs == 2) {
+                imp = imp_implementationWithBlock(^BOOL(id s, id a, id b){ return NO; });
             }
             if (imp) method_setImplementation(methods[j], imp);
         }
