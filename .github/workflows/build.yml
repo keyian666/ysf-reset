@@ -6,32 +6,57 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    # macOS 14 镜像已于 2026-11-02 被 GitHub 全量退役。
+    # 任何 runs-on: macos-14 都会在 1 秒内被取消并报:
+    #   The configuration 'macos-14-arm64-us-default' is not supported
+    # 必须换成 macos-15。
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Theos
         run: |
-          export THEOS=$HOME/theos
-          git clone --recursive https://github.com/theos/theos.git $THEOS
-          curl -L https://github.com/theos/sdks/archive/master.tar.gz -o /tmp/sdks.tar.gz
-          mkdir -p $THEOS/sdks
+          set -euo pipefail
+          export THEOS="$HOME/theos"
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+
+      # Theos 在最后一步要给 dylib 做 ad-hoc 签名, macOS runner 默认没有 ldid。
+      # 少了这一步 make 会在 signing 阶段失败。
+      - name: Install ldid
+        run: |
+          set -euo pipefail
+          brew install ldid
+
+      - name: Fetch iOS SDKs
+        run: |
+          set -euo pipefail
+          mkdir -p "$THEOS/sdks"
+          curl -fL --retry 3 -o /tmp/sdks.tar.gz \
+            https://github.com/theos/sdks/archive/refs/heads/master.tar.gz
           tar -xzf /tmp/sdks.tar.gz -C /tmp
-          mv /tmp/sdks-master/*.sdk $THEOS/sdks/ || true
-          echo "THEOS=$THEOS" >> $GITHUB_ENV
+          mv /tmp/sdks-master/*.sdk "$THEOS/sdks/"
+          echo "--- available SDKs ---"
+          ls "$THEOS/sdks"
 
       - name: Build dylib
         run: |
+          set -euo pipefail
           make clean || true
           make ARCHS="arm64 arm64e" FINALPACKAGE=1
+          echo "--- build output ---"
+          find .theos -name '*.dylib' -print
 
       - name: Collect artifacts
         run: |
+          set -euo pipefail
           mkdir -p dist
-          find .theos -name "*.dylib" -exec cp {} dist/ \;
+          find .theos -name '*.dylib' -exec cp {} dist/ \;
+          test -n "$(ls -A dist)" || { echo "没有产出 dylib"; exit 1; }
           ls -la dist/
 
       - uses: actions/upload-artifact@v4
         with:
           name: YSFDeviceReset-dylib
           path: dist/*.dylib
+          if-no-files-found: error
