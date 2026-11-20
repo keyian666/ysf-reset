@@ -7,8 +7,6 @@ on:
 jobs:
   build:
     # macOS 14 镜像已于 2026-11-02 被 GitHub 全量退役。
-    # 任何 runs-on: macos-14 都会在 1 秒内被取消并报:
-    #   The configuration 'macos-14-arm64-us-default' is not supported
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -20,7 +18,6 @@ jobs:
           git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
 
-      # Theos 最后要给 dylib 做 ad-hoc 签名, macOS runner 默认没有 ldid。
       - name: Install ldid
         run: |
           set -euo pipefail
@@ -38,15 +35,13 @@ jobs:
           echo "--- available SDKs ---"
           ls "$THEOS/sdks"
 
-      # 编译失败时把 tail 写进 Job Summary, 这样在 run 页面就能直接看到报错,
-      # 不必去下载日志或来回猜。
       - name: Build dylib
         run: |
           set -o pipefail
           make clean || true
 
           set +e
-          make ARCHS="arm64 arm64e" FINALPACKAGE=1 > /tmp/build.log 2>&1
+          make ARCHS="arm64" FINALPACKAGE=1 > /tmp/build.log 2>&1
           rc=$?
           set -e
 
@@ -63,16 +58,43 @@ jobs:
             exit "$rc"
           fi
 
-          echo "--- build output ---"
+          echo "--- all dylib-like files ---"
           find .theos -name '*.dylib' -print
 
+      # 关键: 必须排除 .dSYM。
+      # dsymutil 把 DWARF 载荷命名为 <Tweak>.dylib, 放在
+      #   .theos/obj/arm64/<Tweak>.dylib.dSYM/Contents/Resources/DWARF/<Tweak>.dylib
+      # 它也匹配 -name '*.dylib', 排序靠后, 直接覆盖掉真正的 dylib。
+      # 上传出去的就会是 MH_DSYM(filetype=10), TrollFools 里 ldid 报
+      #   "ldid: Unsupported Mach-O type"
       - name: Collect artifacts
         run: |
           set -euo pipefail
           mkdir -p dist
-          find .theos -name '*.dylib' -exec cp {} dist/ \;
-          test -n "$(ls -A dist)" || { echo "没有产出 dylib"; exit 1; }
+
+          while IFS= read -r f; do
+            case "$f" in
+              *.dSYM/*) echo "skip (dSYM payload): $f"; continue ;;
+            esac
+            echo "copy: $f"
+            cp "$f" dist/
+          done < <(find .theos/obj -name '*.dylib' -not -path '*/.dSYM/*' -print)
+
+          test -n "$(ls -A dist)" || { echo "没有找到真正的 dylib"; exit 1; }
+
+          echo "--- dist ---"
           ls -la dist/
+
+          # 硬校验: 偏移 12 处的 filetype 必须是 6 (MH_DYLIB)。
+          # MH_DSYM = 10, MH_OBJECT = 1, 都不对。
+          for f in dist/*; do
+            ft=$(od -An -tu4 -j12 -N4 "$f" | tr -d ' \n')
+            echo "$f  filetype=$ft"
+            if [ "$ft" != "6" ]; then
+              echo "::error::$f 不是 MH_DYLIB (filetype=$ft)，可能是 dSYM"
+              exit 1
+            fi
+          done
 
       - uses: actions/upload-artifact@v4
         with:
