@@ -17,7 +17,12 @@
 #import <objc/message.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <sys/sysctl.h>
-#import <spawn.h>
+
+// Logos 展开 %hook 时会把类名直接当类型用:
+//   static NSUUID * _logos_method$ASIdentifierManager$advertisingIdentifier(ASIdentifierManager * self, SEL _cmd)
+// UIDevice 由 UIKit 提供声明, 但 ASIdentifierManager 在 AdSupport 里,
+// 少了这一句就是 "unknown type name 'ASIdentifierManager'", make 直接以 2 退出。
+@class ASIdentifierManager;
 
 #pragma mark - ========== 锚点 ==========
 
