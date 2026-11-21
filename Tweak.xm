@@ -1,14 +1,19 @@
-// YSFDeviceReset —— 云闪付 (com.unionpay.chsp) 设备身份重置
+// YSFDeviceReset —— 云闪付 (com.unionpay.chsp) 设备身份重置 / 指纹扩面版
 // 目标: iOS 15.x + TrollStore + TrollFools 注入
 //
-// 原理(全部来自 YSF 10.3.8 二进制符号验证):
-//   1) 清 Keychain —— 数美 SMID / 极光 JCore deviceID / 云闪付 UUID 全落在这里,删 App 不删 Keychain
-//   2) 换 IDFV / IDFA —— 数美设备指纹的主要输入
-//   3) 清 NSUserDefaults / 缓存里的 deviceId-uuid-idfa-smid 类键
-//   4) 压掉越狱检测: isJailBreak / hasJailbreakFile / authorityWithJailBreakFlag: 等
+// v2 相比 v1 新增:
+//   - fishhook 重绑 sysctlbyname, 伪装 hw.machine / hw.model / hw.memsize
+//     (不用 MSHookFunction: 沙盒 App 无 dynamic-codesigning, 改代码页会失败)
+//   - NSProcessInfo physicalMemory / systemUptime / hostName
+//   - UIDevice name
+//   - NSFileManager attributesOfFileSystemForPath:error:  (磁盘容量)
+//
+// 伪装画像: iPhone10,1 (iPhone 8)
+//   4.7" 750x1334 @2x / Touch ID / 2GB / A11 —— 与 SE2 的屏幕物理参数完全一致,
+//   UI 层无需任何改动, 也不会出现机型与分辨率矛盾。
 //
 // 关键设计: 只在"首次运行"重滚一次, 之后保持稳定。
-//   每次都换 ID = 典型作弊特征, 反而更容易被数美打分打死。
+//   每次都换 ID = 典型改机特征, 数美会直接打高风险分。
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -17,18 +22,27 @@
 #import <objc/message.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <sys/sysctl.h>
+#import <mach/mach.h>
+#import <mach/vm_map.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
+#import <unistd.h>
+#import <string.h>
+#import <stdlib.h>
+#import <errno.h>
 
-// Logos 展开 %hook 时会把类名直接当类型用:
-//   static NSUUID * _logos_method$ASIdentifierManager$advertisingIdentifier(ASIdentifierManager * self, SEL _cmd)
-// UIDevice 由 UIKit 提供声明, 但 ASIdentifierManager 在 AdSupport 里,
-// 少了这一句就是 "unknown type name 'ASIdentifierManager'", make 直接以 2 退出。
 @class ASIdentifierManager;
+
+#pragma mark - ========== 伪装画像配置 ==========
+
+// 想换别的机型改这三行。务必保持"屏幕尺寸一致", 否则会与 UIScreen 矛盾。
+#define YSF_FAKE_MACHINE   "iPhone10,1"                    // iPhone 8
+#define YSF_FAKE_MODEL     "D20AP"                         // iPhone10,1 主板代号
+#define YSF_FAKE_MEMSIZE   (2ULL * 1024 * 1024 * 1024)     // 2GB, 与 iPhone 8 一致
 
 #pragma mark - ========== 锚点 ==========
 
-// 锚点存放在 App 沙盒 Documents 里:
-//   - 删 App 时一并消失, 语义上正好等于"这是一台新设备"
-//   - 不在 Keychain, 所以不会被 purge 逻辑误删
 static NSString *YSFAnchorPath(void) {
     static NSString *p = nil;
     static dispatch_once_t once;
@@ -40,7 +54,6 @@ static NSString *YSFAnchorPath(void) {
     return p;
 }
 
-// 读取或生成锚点。返回值长度恒为 36 的 UUID 字符串。
 static NSString *YSFAnchor(void) {
     static NSString *anchor = nil;
     static dispatch_once_t once;
@@ -57,8 +70,6 @@ static NSString *YSFAnchor(void) {
     return anchor;
 }
 
-// 把锚点 + salt 派生成一个稳定的 UUID。
-// 同一个进程、不同运行之间都一致 —— 这是"新设备"该有的样子。
 static NSUUID *YSFDeriveUUID(const char *salt) {
     NSString *seed = [NSString stringWithFormat:@"%@|%s", YSFAnchor(), salt];
     NSData *data = [seed dataUsingEncoding:NSUTF8StringEncoding];
@@ -67,8 +78,8 @@ static NSUUID *YSFDeriveUUID(const char *salt) {
 
     unsigned char u[16];
     memcpy(u, d, 16);
-    u[6] = (unsigned char)((u[6] & 0x0F) | 0x40);  // version 4
-    u[8] = (unsigned char)((u[8] & 0x3F) | 0x80);  // RFC4122 variant
+    u[6] = (unsigned char)((u[6] & 0x0F) | 0x40);
+    u[8] = (unsigned char)((u[8] & 0x3F) | 0x80);
     return [[NSUUID alloc] initWithUUIDBytes:u];
 }
 
@@ -76,10 +87,19 @@ static inline NSString *YSFDeriveUUIDString(const char *salt) {
     return [YSFDeriveUUID(salt) UUIDString];
 }
 
-#pragma mark - ========== Keychain 清空 ==========
+// 从锚点派生稳定的 [0,1) 伪随机数, 用于容量/时长这类数值
+static double YSFDeriveFraction(const char *salt) {
+    NSString *seed = [NSString stringWithFormat:@"%@|frac|%s", YSFAnchor(), salt];
+    NSData *data = [seed dataUsingEncoding:NSUTF8StringEncoding];
+    unsigned char d[CC_SHA256_DIGEST_LENGTH] = {0};
+    CC_SHA256(data.bytes, (CC_LONG)data.length, d);
+    unsigned int v = 0;
+    memcpy(&v, d, sizeof(v));
+    return (double)(v % 1000000u) / 1000000.0;
+}
 
-// 只清"本 App access group 内"的条目 —— 注入的 dylib 跑在云闪付进程里,
-// access group 天然合法, 不需要伪造任何 entitlement。
+#pragma mark - ========== Keychain / 缓存清理 ==========
+
 static void YSFPurgeKeychain(void) {
     NSArray *classes = @[
         (__bridge id)kSecClassGenericPassword,
@@ -116,19 +136,12 @@ static void YSFPurgeKeychain(void) {
             for (NSString *k in idKeys) {
                 if (attr[k]) del[k] = attr[k];
             }
-
-            // 只给了 class 的 query 会拒绝删除, 跳过没有可用标识的条目
             if (del.count <= 1) continue;
             SecItemDelete((__bridge CFDictionaryRef)del);
         }
     }
 }
 
-#pragma mark - ========== NSUserDefaults / 缓存清理 ==========
-
-// 二进制里出现过的持久化键名(节选): deviceId / device_id / _deviceIdHead /
-// regRandomUUID / app_uuid / uuidStr / sm_device_id / smId / SimulateIDFA /
-// BOOTUUID / dSYMUUID / JCoreKeychainDeviceIDKey ...
 static BOOL YSFKeyLooksLikeIdentity(NSString *key) {
     static NSArray<NSString *> *needles = nil;
     static dispatch_once_t once;
@@ -137,7 +150,6 @@ static BOOL YSFKeyLooksLikeIdentity(NSString *key) {
                      @"smdevice", @"jcore", @"jpush", @"regrandom", @"bootuuid",
                      @"udid", @"nas", @"imei", @"fingerprint", @"token" ];
     });
-
     NSString *lk = key.lowercaseString;
     for (NSString *n in needles) {
         if ([lk containsString:n]) return YES;
@@ -149,13 +161,10 @@ static void YSFPurgeDefaults(void) {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     NSDictionary *all = [ud dictionaryRepresentation];
     for (NSString *k in all.allKeys) {
-        if (YSFKeyLooksLikeIdentity(k)) {
-            [ud removeObjectForKey:k];
-        }
+        if (YSFKeyLooksLikeIdentity(k)) [ud removeObjectForKey:k];
     }
     [ud synchronize];
 
-    // 各业务域可能各自建了 suite
     NSArray *suites = @[ @"com.unionpay.chsp", @"com.ishumei.antifraud",
                          @"cn.jpush", @"com.unionpay" ];
     for (NSString *s in suites) {
@@ -173,23 +182,219 @@ static void YSFPurgeCaches(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSArray *libs = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
     if (!libs.count) return;
-
     NSString *lib = libs[0];
-    // 这两个目录删掉等价于"干净重装", 且系统会在下次启动时重建
     for (NSString *sub in @[ @"Caches", @"Preferences", @"WebKit", @"HTTPStorages" ]) {
         NSString *p = [lib stringByAppendingPathComponent:sub];
-        NSError *err = nil;
         if ([fm fileExistsAtPath:p]) {
-            [fm removeItemAtPath:p error:&err];
+            [fm removeItemAtPath:p error:NULL];
         }
     }
 }
 
+#pragma mark - ========== fishhook (精简版) ==========
+
+// 重绑 __DATA / __DATA_CONST 中的符号指针, 实现对 libc 函数的拦截。
+// 相比 MSHookFunction, 这条路只改数据段指针, 不需要 dynamic-codesigning。
+
+struct YSF_Rebinding {
+    const char *name;
+    void *replacement;
+    void **replaced;
+};
+
+struct YSF_RebindEntry {
+    struct YSF_Rebinding *items;
+    size_t count;
+    struct YSF_RebindEntry *next;
+};
+
+static struct YSF_RebindEntry *YSF_entries = NULL;
+
+static void YSF_append_entry(struct YSF_RebindEntry *e) {
+    e->next = YSF_entries;
+    YSF_entries = e;
+}
+
+// slide + sec->addr 即为该 section 在内存中的真实地址
+// slide + linkedit->vmaddr - linkedit->fileoff 即为 __LINKEDIT 的真实基址
+static void YSF_rebind_section(const struct section_64 *sec,
+                               intptr_t slide,
+                               uintptr_t linkedit_base,
+                               const struct nlist_64 *symtab,
+                               const char *strtab,
+                               const uint32_t *indirect) {
+    if (!sec->size) return;
+
+    uint32_t count = (uint32_t)(sec->size / sizeof(void *));
+    void **bindings = (void **)((uintptr_t)slide + (uintptr_t)sec->addr);
+    if (!bindings) return;
+
+    for (uint32_t j = 0; j < count; j++) {
+        uint32_t idx = indirect[sec->reserved1 + j];
+        if (idx == INDIRECT_SYMBOL_LOCAL || idx == INDIRECT_SYMBOL_ABS) continue;
+        if (idx == (uint32_t)-1) continue;
+
+        const char *sym = strtab + symtab[idx].n_un.n_strx;
+        if (!sym || !*sym) continue;
+        if (sym[0] == '_') sym++;
+
+        for (struct YSF_RebindEntry *e = YSF_entries; e; e = e->next) {
+            for (size_t i = 0; i < e->count; i++) {
+                if (strcmp(sym, e->items[i].name) != 0) continue;
+
+                void *orig = bindings[j];
+                if (!orig) continue;
+                if (e->items[i].replaced && *(e->items[i].replaced) == NULL) {
+                    *(e->items[i].replaced) = orig;
+                }
+
+                vm_address_t page = (vm_address_t)((uintptr_t)&bindings[j] &
+                                                   ~(uintptr_t)(getpagesize() - 1));
+                vm_size_t len = (vm_size_t)getpagesize() * 2;
+                vm_protect(mach_task_self(), page, len, false,
+                           VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                bindings[j] = e->items[i].replacement;
+                vm_protect(mach_task_self(), page, len, false, VM_PROT_READ);
+            }
+        }
+    }
+    (void)linkedit_base;
+}
+
+static void YSF_rebind_image(const struct mach_header_64 *mh, intptr_t slide) {
+    if (!mh) return;
+
+    const struct segment_command_64 *linkedit = NULL;
+    const struct segment_command_64 *segs[2] = { NULL, NULL };
+    const struct symtab_command *symtabCmd = NULL;
+    const struct dysymtab_command *dysymtabCmd = NULL;
+
+    uintptr_t cursor = (uintptr_t)mh + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cursor;
+        if (lc->cmdsize == 0) break;
+
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
+            if (strcmp(sc->segname, "__LINKEDIT") == 0)      linkedit = sc;
+            else if (strcmp(sc->segname, "__DATA") == 0)     segs[0] = sc;
+            else if (strcmp(sc->segname, "__DATA_CONST") == 0) segs[1] = sc;
+        } else if (lc->cmd == LC_SYMTAB) {
+            symtabCmd = (const struct symtab_command *)lc;
+        } else if (lc->cmd == LC_DYSYMTAB) {
+            dysymtabCmd = (const struct dysymtab_command *)lc;
+        }
+        cursor += lc->cmdsize;
+    }
+
+    if (!linkedit || !symtabCmd || !dysymtabCmd) return;
+
+    uintptr_t linkedit_base = (uintptr_t)slide
+                            + (uintptr_t)linkedit->vmaddr
+                            - (uintptr_t)linkedit->fileoff;
+
+    const struct nlist_64 *symtab = (const struct nlist_64 *)(linkedit_base + symtabCmd->symoff);
+    const char *strtab = (const char *)(linkedit_base + symtabCmd->stroff);
+    const uint32_t *indirect = (const uint32_t *)(linkedit_base + dysymtabCmd->indirectsymoff);
+    if (!symtab || !strtab || !indirect) return;
+
+    for (int s = 0; s < 2; s++) {
+        const struct segment_command_64 *seg = segs[s];
+        if (!seg) continue;
+
+        const struct section_64 *sect = (const struct section_64 *)
+            ((const char *)seg + sizeof(struct segment_command_64));
+        for (uint32_t k = 0; k < seg->nsects; k++) {
+            uint32_t type = sect[k].flags & SECTION_TYPE;
+            if (type == S_LAZY_SYMBOL_POINTERS || type == S_NON_LAZY_SYMBOL_POINTERS) {
+                YSF_rebind_section(&sect[k], slide, linkedit_base, symtab, strtab, indirect);
+            }
+        }
+    }
+}
+
+static void YSF_rebind_callback(const struct mach_header *mh, intptr_t slide) {
+    if (!mh) return;
+    if (mh->magic != MH_MAGIC_64) return;
+    YSF_rebind_image((const struct mach_header_64 *)mh, slide);
+}
+
+static void YSF_rebind_all(void) {
+    uint32_t total = _dyld_image_count();
+    for (uint32_t i = 0; i < total; i++) {
+        YSF_rebind_callback(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
+    }
+    _dyld_register_func_for_add_image(YSF_rebind_callback);
+}
+
+#pragma mark - ========== sysctlbyname 拦截 ==========
+
+static int (*YSF_orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
+
+static int YSF_fake_sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
+                                 void *newp, size_t newlen) {
+    if (name && newp == NULL) {
+        const char *strval = NULL;
+        char bootbuf[37] = {0};
+
+        if (strcmp(name, "hw.machine") == 0) {
+            strval = YSF_FAKE_MACHINE;
+        } else if (strcmp(name, "hw.model") == 0) {
+            strval = YSF_FAKE_MODEL;
+        } else if (strcmp(name, "kern.bootsessionuuid") == 0) {
+            // 真实设备每次开机都会变, 这里每次启动也重新生成, 保持"正常"的样子
+            static char cached[37] = {0};
+            if (!cached[0]) {
+                NSString *u = [[NSUUID UUID] UUIDString];
+                memcpy(cached, u.UTF8String, sizeof(cached) - 1);
+            }
+            memcpy(bootbuf, cached, sizeof(bootbuf) - 1);
+            strval = bootbuf;
+        }
+
+        if (strval) {
+            size_t need = strlen(strval) + 1;
+            if (oldp == NULL) {
+                if (oldlenp) *oldlenp = need;
+                return 0;
+            }
+            if (oldlenp == NULL) return EINVAL;
+            if (*oldlenp < need) {
+                *oldlenp = need;
+                return ENOMEM;
+            }
+            memcpy(oldp, strval, need);
+            *oldlenp = need;
+            return 0;
+        }
+
+        if (strcmp(name, "hw.memsize") == 0) {
+            unsigned long long numval = YSF_FAKE_MEMSIZE;
+            size_t need = sizeof(numval);
+            if (oldp == NULL) {
+                if (oldlenp) *oldlenp = need;
+                return 0;
+            }
+            if (oldlenp == NULL) return EINVAL;
+            if (*oldlenp < need) {
+                *oldlenp = need;
+                return ENOMEM;
+            }
+            memcpy(oldp, &numval, need);
+            *oldlenp = need;
+            return 0;
+        }
+    }
+
+    if (YSF_orig_sysctlbyname) {
+        return YSF_orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+    }
+    return ENOTSUP;
+}
+
 #pragma mark - ========== 通用 swizzle 工具 ==========
 
-// 把指定 selector (不论它定义在哪个类上) 改成返回固定对象。
-// 用于 GetHkeDeviceIdentifierV7/V8/V8Strong/V8WeakWithArg: 这类银联 ISOpenSDK 方法。
-static void YSFSwizzleSelectorReturningObject(const char *selCStr, id (^value)(void)) {
+static void YSFSwizzleSelReturnObject(const char *selCStr, id (^value)(void)) {
     SEL sel = sel_registerName(selCStr);
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
@@ -205,9 +410,6 @@ static void YSFSwizzleSelectorReturningObject(const char *selCStr, id (^value)(v
 
             NSUInteger nargs = method_getNumberOfArguments(methods[j]) - 2;
             IMP imp = NULL;
-            // 注意: 这里必须是 if/else 而不是 switch。
-            // ARC 下 case 标签里声明"捕获了 value 的 block"属于跳过变量初始化的跳转,
-            // clang 会直接报 cannot jump from switch statement to this case label。
             if (nargs == 0) {
                 imp = imp_implementationWithBlock(^id(id s){ return value(); });
             } else if (nargs == 1) {
@@ -224,10 +426,7 @@ static void YSFSwizzleSelectorReturningObject(const char *selCStr, id (^value)(v
     free(classes);
 }
 
-// 把指定 selector 改成返回 NO。
-// 用于 isJailBreak / hasJailbreakFile / hasMobileSubstrate / isRooted /
-// p_isJailBreak1 / p_isJailBreak2 / isJailBreakWithPtrace:
-static void YSFSwizzleSelectorReturningNO(const char *selCStr) {
+static void YSFSwizzleSelReturnNO(const char *selCStr) {
     SEL sel = sel_registerName(selCStr);
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
@@ -257,11 +456,67 @@ static void YSFSwizzleSelectorReturningNO(const char *selCStr) {
     free(classes);
 }
 
-#pragma mark - ========== 钩子: 原生标识 ==========
+static void YSFSwizzleSelReturnU64(const char *selCStr, unsigned long long fixed) {
+    SEL sel = sel_registerName(selCStr);
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    if (!classes) return;
+
+    for (unsigned int i = 0; i < count; i++) {
+        unsigned int mcount = 0;
+        Method *methods = class_copyMethodList(classes[i], &mcount);
+        if (!methods) continue;
+
+        for (unsigned int j = 0; j < mcount; j++) {
+            if (method_getName(methods[j]) != sel) continue;
+            if (method_getNumberOfArguments(methods[j]) != 2) continue;
+
+            IMP imp = imp_implementationWithBlock(^unsigned long long(id s){ return fixed; });
+            if (imp) method_setImplementation(methods[j], imp);
+        }
+        free(methods);
+    }
+    free(classes);
+}
+
+static void YSFSwizzleSelReturnDouble(const char *selCStr, double fixed) {
+    SEL sel = sel_registerName(selCStr);
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    if (!classes) return;
+
+    for (unsigned int i = 0; i < count; i++) {
+        unsigned int mcount = 0;
+        Method *methods = class_copyMethodList(classes[i], &mcount);
+        if (!methods) continue;
+
+        for (unsigned int j = 0; j < mcount; j++) {
+            if (method_getName(methods[j]) != sel) continue;
+            if (method_getNumberOfArguments(methods[j]) != 2) continue;
+
+            IMP imp = imp_implementationWithBlock(^double(id s){ return fixed; });
+            if (imp) method_setImplementation(methods[j], imp);
+        }
+        free(methods);
+    }
+    free(classes);
+}
+
+#pragma mark - ========== ObjC 钩子: 原生标识 ==========
 
 %hook UIDevice
 - (NSUUID *)identifierForVendor {
     return YSFDeriveUUID("idfv");
+}
+- (NSString *)name {
+    static NSString *n = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSArray *pool = @[ @"iPhone", @"iPhone 的 iPhone", @"Apple iPhone", @"我的 iPhone" ];
+        NSUInteger idx = (NSUInteger)(YSFDeriveFraction("devicename") * (double)pool.count) % pool.count;
+        n = pool[idx];
+    });
+    return n;
 }
 %end
 
@@ -274,9 +529,6 @@ static void YSFSwizzleSelectorReturningNO(const char *selCStr) {
 }
 %end
 
-// 极光 SimulateIDFA 走的是自己的 keychain 键, 键已被清空,
-// 首次调用会重新生成 —— 不需要额外 hook。
-
 #pragma mark - ========== 启动逻辑 ==========
 
 %ctor {
@@ -286,47 +538,80 @@ static void YSFSwizzleSelectorReturningNO(const char *selCStr) {
                                 stringByAppendingPathComponent:@".ysf_reroll"];
         NSFileManager *fm = [NSFileManager defaultManager];
 
-        BOOL fresh = ![fm fileExistsAtPath:anchorPath];
+        BOOL fresh  = ![fm fileExistsAtPath:anchorPath];
         BOOL reroll = [fm fileExistsAtPath:rerollPath];
 
         if (fresh || reroll) {
-            // 顺序很重要: 先清 keychain, 再清 defaults, 最后落锚点。
-            // 任何一个业务 SDK 在 didFinishLaunching 里读 keychain 时,
-            // 看到的都已经是空的了。
             YSFPurgeKeychain();
             YSFPurgeDefaults();
             YSFPurgeCaches();
-            (void)YSFAnchor();               // 写入新锚点
+            (void)YSFAnchor();
             if (reroll) [fm removeItemAtPath:rerollPath error:NULL];
         }
 
-        // ---- 银联 ISOpenSDK 设备标识 (selector 名带冒号, 是 ObjC 方法) ----
-        YSFSwizzleSelectorReturningObject("GetHkeDeviceIdentifierV8StrongWithArg:", ^{
+        // ---- libc: sysctlbyname (机型 / 主板 / 内存 / 启动会话 UUID) ----
+        struct YSF_RebindEntry *e = (struct YSF_RebindEntry *)malloc(sizeof(struct YSF_RebindEntry));
+        if (e) {
+            e->items = (struct YSF_Rebinding *)malloc(sizeof(struct YSF_Rebinding));
+            if (e->items) {
+                e->items[0].name        = "sysctlbyname";
+                e->items[0].replacement = (void *)YSF_fake_sysctlbyname;
+                e->items[0].replaced    = (void **)&YSF_orig_sysctlbyname;
+                e->count = 1;
+                YSF_append_entry(e);
+                YSF_rebind_all();
+            } else {
+                free(e);
+            }
+        }
+
+        // ---- NSProcessInfo ----
+        YSFSwizzleSelReturnU64("physicalMemory", (unsigned long long)YSF_FAKE_MEMSIZE);
+        YSFSwizzleSelReturnDouble("systemUptime",
+                                  3600.0 * (3.0 + YSFDeriveFraction("uptime") * 69.0));
+        YSFSwizzleSelReturnObject("hostName", ^{
+            return (id)@"iPhone";
+        });
+
+        // ---- 磁盘容量 ----
+        YSFSwizzleSelReturnObject("attributesOfFileSystemForPath:error:", ^{
+            double f = YSFDeriveFraction("disk");
+            unsigned long long total = 64ULL * 1000 * 1000 * 1000;
+            if (f > 0.66)      total = 256ULL * 1000 * 1000 * 1000;
+            else if (f > 0.33) total = 128ULL * 1000 * 1000 * 1000;
+            unsigned long long freeBytes =
+                (unsigned long long)((double)total * (0.25 + YSFDeriveFraction("diskfree") * 0.5));
+            return (id)@{
+                NSFileSystemSize:     @(total),
+                NSFileSystemFreeSize: @(freeBytes),
+            };
+        });
+
+        // ---- 银联 ISOpenSDK 设备标识 ----
+        YSFSwizzleSelReturnObject("GetHkeDeviceIdentifierV8StrongWithArg:", ^{
             return (id)YSFDeriveUUIDString("hke-v8-strong");
         });
-        YSFSwizzleSelectorReturningObject("GetHkeDeviceIdentifierV8WeakWithArg:", ^{
+        YSFSwizzleSelReturnObject("GetHkeDeviceIdentifierV8WeakWithArg:", ^{
             return (id)YSFDeriveUUIDString("hke-v8-weak");
         });
-        YSFSwizzleSelectorReturningObject("GetHkeDeviceIdentifierV8WithArg:", ^{
+        YSFSwizzleSelReturnObject("GetHkeDeviceIdentifierV8WithArg:", ^{
             return (id)YSFDeriveUUIDString("hke-v8");
         });
-        YSFSwizzleSelectorReturningObject("GetHkeDeviceIdentifierV7WithArg:", ^{
+        YSFSwizzleSelReturnObject("GetHkeDeviceIdentifierV7WithArg:", ^{
             return (id)YSFDeriveUUIDString("hke-v7");
         });
 
         // ---- 越狱 / 签名痕迹 ----
-        const char *noSels[] = {
+        static const char *noSels[] = {
             "isJailBreak", "hasJailbreakFile", "hasMobileSubstrate", "isRooted",
             "p_isJailBreak1", "p_isJailBreak2", "isJailBreakWithPtrace:",
             "hasCydia", "isDeviceJailbreak", "checkJailBreak",
         };
         for (size_t i = 0; i < sizeof(noSels) / sizeof(noSels[0]); i++) {
-            YSFSwizzleSelectorReturningNO(noSels[i]);
+            YSFSwizzleSelReturnNO(noSels[i]);
         }
 
-        // authorityWithJailBreakFlag: 会去读代码签名 authority,
-        // TrollStore/TrollFools 重签后这里会露馅 —— 直接返回 nil。
-        YSFSwizzleSelectorReturningObject("authorityWithJailBreakFlag:", ^{
+        YSFSwizzleSelReturnObject("authorityWithJailBreakFlag:", ^{
             return (id)nil;
         });
     }
